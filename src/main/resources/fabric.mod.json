@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "pressurecobweb",
+  "version": "${version}",
+  "name": "Pressure Cobweb",
+  "description": "Automatically places a cobweb above a newly placed pressure plate.",
+  "authors": [
+    "Miru"
+  ],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.miru.pressurecobweb.PressureCobwebClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
