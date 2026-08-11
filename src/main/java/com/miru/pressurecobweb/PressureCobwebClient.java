@@ -1,4 +1,4 @@
-```java
+
 package com.miru.pressurecobweb;
 
 import com.mojang.brigadier.CommandDispatcher;
@@ -607,4 +607,3 @@ public class PressureCobwebClient implements ClientModInitializer {
         swappedFromInventory = false;
     }
 }
-```
