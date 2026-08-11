@@ -1,3 +1,4 @@
+```java
 package com.miru.pressurecobweb;
 
 import com.mojang.brigadier.CommandDispatcher;
@@ -35,8 +36,9 @@ public class PressureCobwebClient implements ClientModInitializer {
     /*
      * 0 = idle
      * 1 = waiting for plate
-     * 2 = waiting after cobweb selection
-     * 3 = waiting after placement
+     * 2 = waiting for inventory swap
+     * 3 = placing cobweb
+     * 4 = waiting before restore
      */
     private static int stage = 0;
 
@@ -60,8 +62,8 @@ public class PressureCobwebClient implements ClientModInitializer {
         );
 
         /*
-         * Detect ONLY the pressure plate that the player
-         * is currently placing.
+         * Detect the pressure plate the player is
+         * actually trying to place.
          */
         UseItemCallback.EVENT.register(
                 (player, world, hand) -> {
@@ -91,18 +93,29 @@ public class PressureCobwebClient implements ClientModInitializer {
                     }
 
                     /*
-                     * Exact position where Minecraft will place
-                     * the pressure plate.
+                     * Position where the pressure plate
+                     * will be placed.
                      */
                     targetPlate =
                             hit.getBlockPos()
                                     .offset(hit.getSide())
                                     .toImmutable();
 
+                    /*
+                     * Save the currently selected hotbar slot
+                     * BEFORE doing anything.
+                     */
+                    originalHotbarSlot =
+                            player.getInventory().getSelectedSlot();
+
+                    inventorySlot = -1;
+                    swappedFromInventory = false;
+
                     stage = 1;
 
                     /*
-                     * Wait for the real pressure plate placement.
+                     * Wait for server/client to actually
+                     * create the plate.
                      */
                     ticks = 2;
 
@@ -178,7 +191,10 @@ public class PressureCobwebClient implements ClientModInitializer {
         }
 
         /*
-         * WAIT FOR THE EXACT PRESSURE PLATE.
+         * ==========================================
+         * STAGE 1
+         * Wait until the pressure plate exists.
+         * ==========================================
          */
         if (stage == 1) {
 
@@ -188,20 +204,17 @@ public class PressureCobwebClient implements ClientModInitializer {
                     instanceof PressurePlateBlock)) {
 
                 /*
-                 * Plate has not arrived from the server yet.
+                 * Server has not updated the plate yet.
                  */
                 ticks = 1;
                 return;
             }
 
-            /*
-             * Only target THIS plate.
-             */
             BlockPos cobwebPos =
                     targetPlate.up();
 
             /*
-             * Don't touch it if something is already above it.
+             * Must be completely empty above the plate.
              */
             if (!client.world
                     .getBlockState(cobwebPos)
@@ -211,6 +224,10 @@ public class PressureCobwebClient implements ClientModInitializer {
                 return;
             }
 
+            /*
+             * Find cobweb and move it into the
+             * currently selected hotbar slot.
+             */
             if (!selectCobweb(client)) {
 
                 reset();
@@ -218,7 +235,7 @@ public class PressureCobwebClient implements ClientModInitializer {
             }
 
             /*
-             * Give the selected slot/swap one tick to sync.
+             * Give the inventory update one tick.
              */
             stage = 2;
             ticks = 1;
@@ -227,9 +244,46 @@ public class PressureCobwebClient implements ClientModInitializer {
         }
 
         /*
-         * PLACE COBWEB.
+         * ==========================================
+         * STAGE 2
+         * Verify cobweb is actually selected.
+         * ==========================================
          */
         if (stage == 2) {
+
+            PlayerInventory inv =
+                    client.player.getInventory();
+
+            if (!inv.getSelectedStack()
+                    .isOf(Items.COBWEB)) {
+
+                /*
+                 * Inventory swap did not happen yet.
+                 * Try once more.
+                 */
+                if (!retrySwap(client)) {
+                    restore(client);
+                    reset();
+                    return;
+                }
+
+                ticks = 1;
+                return;
+            }
+
+            stage = 3;
+            ticks = 0;
+
+            return;
+        }
+
+        /*
+         * ==========================================
+         * STAGE 3
+         * Place cobweb.
+         * ==========================================
+         */
+        if (stage == 3) {
 
             if (!placeCobweb(client)) {
 
@@ -239,23 +293,23 @@ public class PressureCobwebClient implements ClientModInitializer {
             }
 
             /*
-             * Do NOT restore immediately.
-             *
-             * Let the placement packet finish first.
+             * Wait for placement packet/server update.
              */
-            stage = 3;
+            stage = 4;
             ticks = 2;
 
             return;
         }
 
         /*
-         * RESTORE ORIGINAL HOTBAR/INVENTORY.
+         * ==========================================
+         * STAGE 4
+         * Restore original inventory state.
+         * ==========================================
          */
-        if (stage == 3) {
+        if (stage == 4) {
 
             restore(client);
-
             reset();
         }
     }
@@ -273,38 +327,55 @@ public class PressureCobwebClient implements ClientModInitializer {
             return false;
         }
 
+        /*
+         * Always remember the real selected slot.
+         */
         originalHotbarSlot =
                 inv.getSelectedSlot();
 
-        inventorySlot = -1;
-
-        swappedFromInventory = false;
-
         /*
+         * ==========================================
          * COBWEB ALREADY IN HOTBAR
+         * ==========================================
          */
         if (slot >= PlayerInventory.MAIN_SIZE) {
 
-            int hotbar =
+            int hotbarSlot =
                     slot - PlayerInventory.MAIN_SIZE;
 
-            inv.setSelectedSlot(hotbar);
+            inv.setSelectedSlot(hotbarSlot);
+
+            swappedFromInventory = false;
+            inventorySlot = -1;
 
             return true;
         }
 
         /*
-         * COBWEB IN MAIN INVENTORY.
+         * ==========================================
+         * COBWEB IN MAIN INVENTORY
+         * ==========================================
          *
-         * Player inventory screen slots:
+         * PlayerScreenHandler slot IDs:
          *
-         * main inventory starts at slot 9
-         * hotbar starts at slot 36
+         * 9  = inventory slot 0
+         * 10 = inventory slot 1
+         * ...
+         * 35 = inventory slot 26
+         *
+         * 36-44 = hotbar
          */
-        int screenSlot = 9 + slot;
+        int screenSlot =
+                9 + slot;
 
+        /*
+         * SWAP button is the selected hotbar slot.
+         *
+         * SlotActionType.SWAP exchanges the clicked
+         * inventory slot with that hotbar slot.
+         */
         client.interactionManager.clickSlot(
-                client.player.currentScreenHandler.syncId,
+                client.player.playerScreenHandler.syncId,
                 screenSlot,
                 originalHotbarSlot,
                 SlotActionType.SWAP,
@@ -312,8 +383,43 @@ public class PressureCobwebClient implements ClientModInitializer {
         );
 
         inventorySlot = slot;
-
         swappedFromInventory = true;
+
+        return true;
+    }
+
+    private static boolean retrySwap(
+            MinecraftClient client
+    ) {
+
+        if (!swappedFromInventory
+                || inventorySlot < 0
+                || originalHotbarSlot < 0) {
+            return false;
+        }
+
+        PlayerInventory inv =
+                client.player.getInventory();
+
+        /*
+         * If cobweb already arrived in selected slot,
+         * nothing more is needed.
+         */
+        if (inv.getSelectedStack()
+                .isOf(Items.COBWEB)) {
+            return true;
+        }
+
+        int screenSlot =
+                9 + inventorySlot;
+
+        client.interactionManager.clickSlot(
+                client.player.playerScreenHandler.syncId,
+                screenSlot,
+                originalHotbarSlot,
+                SlotActionType.SWAP,
+                client.player
+        );
 
         return true;
     }
@@ -330,7 +436,8 @@ public class PressureCobwebClient implements ClientModInitializer {
                 client.player.getInventory();
 
         /*
-         * Confirm cobweb is REALLY selected.
+         * Make absolutely sure the selected item
+         * is a cobweb.
          */
         if (!inv.getSelectedStack()
                 .isOf(Items.COBWEB)) {
@@ -338,8 +445,7 @@ public class PressureCobwebClient implements ClientModInitializer {
         }
 
         /*
-         * Make sure the target is still the same
-         * pressure plate.
+         * Make sure this is still the exact plate.
          */
         if (!(client.world
                 .getBlockState(targetPlate)
@@ -348,28 +454,32 @@ public class PressureCobwebClient implements ClientModInitializer {
             return false;
         }
 
+        BlockPos cobwebPos =
+                targetPlate.up();
+
         /*
-         * Make sure the EXACT position above the plate
-         * is empty.
+         * The block above must still be empty.
          */
         if (!client.world
-                .getBlockState(targetPlate.up())
+                .getBlockState(cobwebPos)
                 .isAir()) {
             return false;
         }
 
         /*
-         * CLICK THE TOP FACE OF THE EXACT PLATE.
+         * Hit the TOP FACE of the exact pressure plate.
          *
-         * This tells Minecraft:
+         * Plate center:
+         * X + 0.5
+         * Y + 0.5
+         * Z + 0.5
          *
-         * "Place the selected cobweb against THIS plate,
-         * on its UP face."
+         * Top face is slightly above the center.
          */
         BlockHitResult hit =
                 new BlockHitResult(
                         targetPlate.toCenterPos()
-                                .add(0.0, 0.45, 0.0),
+                                .add(0.0, 0.5, 0.0),
                         Direction.UP,
                         targetPlate,
                         false
@@ -382,9 +492,6 @@ public class PressureCobwebClient implements ClientModInitializer {
                         hit
                 );
 
-        /*
-         * Only continue if Minecraft accepted the interaction.
-         */
         return result != ActionResult.FAIL;
     }
 
@@ -393,7 +500,7 @@ public class PressureCobwebClient implements ClientModInitializer {
     ) {
 
         /*
-         * Main inventory.
+         * Search normal inventory first.
          */
         for (int i = 0;
              i < PlayerInventory.MAIN_SIZE;
@@ -410,7 +517,7 @@ public class PressureCobwebClient implements ClientModInitializer {
         }
 
         /*
-         * Hotbar.
+         * Search hotbar.
          */
         for (int i = PlayerInventory.MAIN_SIZE;
              i < PlayerInventory.MAIN_SIZE
@@ -443,17 +550,23 @@ public class PressureCobwebClient implements ClientModInitializer {
                 client.player.getInventory();
 
         /*
-         * Cobweb came from main inventory.
+         * Cobweb originally came from main inventory.
+         *
+         * Swap the original item back.
          */
         if (swappedFromInventory
                 && inventorySlot >= 0
                 && originalHotbarSlot >= 0) {
 
+            /*
+             * If selected slot no longer contains the
+             * original item, perform the swap back.
+             */
             int screenSlot =
                     9 + inventorySlot;
 
             client.interactionManager.clickSlot(
-                    client.player.currentScreenHandler.syncId,
+                    client.player.playerScreenHandler.syncId,
                     screenSlot,
                     originalHotbarSlot,
                     SlotActionType.SWAP,
@@ -469,6 +582,7 @@ public class PressureCobwebClient implements ClientModInitializer {
 
         /*
          * Cobweb was already in hotbar.
+         * Just return to the original slot.
          */
         if (originalHotbarSlot >= 0) {
 
@@ -493,3 +607,4 @@ public class PressureCobwebClient implements ClientModInitializer {
         swappedFromInventory = false;
     }
 }
+```
